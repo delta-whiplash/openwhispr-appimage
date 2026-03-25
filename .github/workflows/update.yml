@@ -70,7 +70,7 @@ jobs:
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > /root/.ssh/aur_key
           chmod 600 /root/.ssh/aur_key
           # AUR ed25519 host key
-          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPrCofH4hV6cC3S6jHmunRl6nMcS2hj+/6yyLh7Tnp4k" >> /root/.ssh/known_hosts
+          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN" >> /root/.ssh/known_hosts
           cat >> /root/.ssh/config <<'EOF'
           Host aur.archlinux.org
             IdentityFile /root/.ssh/aur_key
