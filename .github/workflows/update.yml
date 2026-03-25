@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   # -----------------------------------------------------------------
-  # Job 1: Check if update is needed (runs on Ubuntu, ~3s)
+  # Job 1: Check versions + Summary (Ubuntu, ~3s)
   # -----------------------------------------------------------------
   check:
     runs-on: ubuntu-latest
@@ -24,7 +24,6 @@ jobs:
       - name: Check versions
         id: check
         run: |
-          # Fetch upstream version
           UPSTREAM=$(curl -fsSL "https://api.github.com/repos/OpenWhispr/openwhispr/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
 
           if [[ -z "$UPSTREAM" || "$UPSTREAM" == "null" ]]; then
@@ -32,7 +31,6 @@ jobs:
             exit 1
           fi
 
-          # Fetch current AUR version (PKGBUILD is accessible via raw URL)
           PKGBUILD=$(curl -fsSL "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=openwhispr-appimage")
           CURRENT=$(echo "$PKGBUILD" | grep '^pkgver=' | head -1 | cut -d= -f2)
 
@@ -42,14 +40,16 @@ jobs:
 
           if [[ "$CURRENT" == "$UPSTREAM" ]]; then
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Already at ${UPSTREAM}, no update needed"
+            echo "## ⏭️ No update needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Both at version **${UPSTREAM}**" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Update needed: ${CURRENT} -> ${UPSTREAM}"
+            echo "## 🔄 Update needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "${CURRENT} → ${UPSTREAM}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # -----------------------------------------------------------------
-  # Job 2: Update AUR (only runs if needed, ~20-30s)
+  # Job 2: Update AUR (Arch container, only if needed)
   # -----------------------------------------------------------------
   update:
     needs: check
@@ -59,88 +59,38 @@ jobs:
       image: archlinux:latest
 
     steps:
-      - name: Install minimal dependencies
-        run: |
-          # Skip system upgrade (-Sy instead of -Syu) to save ~10s
-          pacman -Sy --noconfirm \
-            git \
-            pacman-contrib \
-            openssh \
-            sudo
+      - name: Install dependencies
+        run: pacman -Sy --noconfirm git pacman-contrib openssh sudo
 
-      - name: Create builder user
+      - name: Setup builder
         run: |
           useradd -m -s /bin/bash builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           mkdir -p /home/builder/pkg
           chown -R builder:builder /home/builder/pkg
 
-      - name: Configure SSH for AUR
+      - name: Configure SSH
         run: |
           mkdir -p /root/.ssh
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > /root/.ssh/aur_key
           chmod 600 /root/.ssh/aur_key
           echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN" >> /root/.ssh/known_hosts
-          cat >> /root/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            IdentityFile /root/.ssh/aur_key
-            User aur
-          EOF
+          printf "Host aur.archlinux.org\n  IdentityFile /root/.ssh/aur_key\n  User aur\n" >> /root/.ssh/config
 
-      - name: Clone AUR repository
+      - name: Clone & update
         run: |
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
           git clone ssh://aur@aur.archlinux.org/openwhispr-appimage.git /home/builder/pkg
           chown -R builder:builder /home/builder/pkg
 
-      - name: Update PKGBUILD
-        run: |
-          NEW_VER="${{ needs.check.outputs.upstream_version }}"
-          sed -i "s/^pkgver=.*/pkgver=${NEW_VER}/" /home/builder/pkg/PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" /home/builder/pkg/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${NEW_VER}/; s/^pkgrel=.*/pkgrel=1/" /home/builder/pkg/PKGBUILD
 
-      - name: Update checksums
-        run: |
-          sudo -u builder bash -c "cd /home/builder/pkg && updpkgsums"
-          if grep -q "SKIP" /home/builder/pkg/PKGBUILD; then
-            echo "ERROR: updpkgsums failed"
-            exit 1
-          fi
+          sudo -u builder bash -c "cd /home/builder/pkg && updpkgsums && makepkg --printsrcinfo > .SRCINFO"
 
-      - name: Regenerate .SRCINFO
-        run: |
-          sudo -u builder bash -c "cd /home/builder/pkg && makepkg --printsrcinfo > .SRCINFO"
-
-      - name: Commit and push
-        run: |
-          NEW_VER="${{ needs.check.outputs.upstream_version }}"
           git -C /home/builder/pkg config user.name "AUR Update Bot"
           git -C /home/builder/pkg config user.email "bot@users.noreply.github.com"
           git -C /home/builder/pkg add PKGBUILD .SRCINFO
-          git -C /home/builder/pkg commit -m "upgpkg: openwhispr-appimage ${NEW_VER}"
+          git -C /home/builder/pkg commit -m "upgpkg: ${NEW_VER}"
           git -C /home/builder/pkg push
 
-      - name: Summary
-        run: |
-          echo "## ✅ Updated to ${{ needs.check.outputs.upstream_version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Previous: ${{ needs.check.outputs.current_version }}" >> "$GITHUB_STEP_SUMMARY"
-
-  # -----------------------------------------------------------------
-  # Job 3: Summary (always runs)
-  # -----------------------------------------------------------------
-  summary:
-    needs: [check, update]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Final summary
-        run: |
-          if [[ "${{ needs.check.outputs.needs_update }}" == "false" ]]; then
-            echo "## ⏭️ No update needed" >> "$GITHUB_STEP_SUMMARY"
-            echo "Both at version **${{ needs.check.outputs.upstream_version }}**" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "${{ needs.update.result }}" == "success" ]]; then
-            echo "## ✅ Update successful" >> "$GITHUB_STEP_SUMMARY"
-            echo "${{ needs.check.outputs.current_version }} → ${{ needs.check.outputs.upstream_version }}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## ❌ Update failed" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+          echo "## ✅ Updated to ${NEW_VER}" >> "$GITHUB_STEP_SUMMARY"
