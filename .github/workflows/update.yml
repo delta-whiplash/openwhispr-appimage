@@ -1,0 +1,173 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    # Every day at 08:00 UTC
+    - cron: '0 8 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+concurrency:
+  group: aur-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. System setup — install all required tooling
+      # ---------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm \
+            git \
+            devtools \
+            jq \
+            curl \
+            sudo \
+            binutils \
+            openssh \
+            pacman-contrib
+
+      # ---------------------------------------------------------------
+      # 2. Create an unprivileged builder user
+      #    makepkg / updpkgsums refuse to run as root
+      # ---------------------------------------------------------------
+      - name: Create builder user with passwordless sudo
+        run: |
+          useradd -m -s /bin/bash builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          # Give the builder ownership of the workspace at /home/builder/pkg
+          mkdir -p /home/builder/pkg
+          chown -R builder:builder /home/builder/pkg
+
+      # ---------------------------------------------------------------
+      # 3. Detect latest upstream version via GitHub API
+      # ---------------------------------------------------------------
+      - name: Detect latest upstream version
+        id: upstream
+        run: |
+          RESPONSE=$(curl -fsSL "https://api.github.com/repos/OpenWhispr/openwhispr/releases/latest")
+          LATEST=$(echo "$RESPONSE" | jq -r '.tag_name' | sed 's/^v//')
+          if [[ -z "$LATEST" || "$LATEST" == "null" ]]; then
+            echo "Failed to fetch upstream version"
+            exit 1
+          fi
+          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Detected upstream version: ${LATEST}"
+
+      # ---------------------------------------------------------------
+      # 4. Checkout the AUR repository
+      #    Uses AUR SSH deploy key stored as repo secret
+      # ---------------------------------------------------------------
+      - name: Configure SSH for AUR
+        run: |
+          mkdir -p /root/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > /root/.ssh/aur_key
+          chmod 600 /root/.ssh/aur_key
+          # AUR ed25519 host key
+          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPrCofH4hV6cC3S6jHmunRl6nMcS2hj+/6yyLh7Tnp4k" >> /root/.ssh/known_hosts
+          cat >> /root/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile /root/.ssh/aur_key
+            User aur
+          EOF
+
+      - name: Clone AUR repository
+        run: |
+          git clone ssh://aur@aur.archlinux.org/openwhispr-appimage.git \
+            /home/builder/pkg
+          chown -R builder:builder /home/builder/pkg
+
+      # ---------------------------------------------------------------
+      # 5. Check whether an update is actually needed
+      # ---------------------------------------------------------------
+      - name: Check current packaged version
+        id: current
+        run: |
+          # Source PKGBUILD to extract pkgver reliably
+          source /home/builder/pkg/PKGBUILD
+          echo "version=${pkgver}" >> "$GITHUB_OUTPUT"
+          echo "Packaged version: ${pkgver}"
+
+      - name: Skip if already up-to-date
+        if: steps.current.outputs.version == steps.upstream.outputs.version
+        run: |
+          echo "Already at ${steps.upstream.outputs.version}, nothing to do."
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 6. Update pkgver & reset pkgrel in PKGBUILD
+      # ---------------------------------------------------------------
+      - name: Update PKGBUILD version
+        if: steps.current.outputs.version != steps.upstream.outputs.version
+        run: |
+          NEW_VER="${{ steps.upstream.outputs.version }}"
+          sed -i "s/^pkgver=.*/pkgver=${NEW_VER}/" /home/builder/pkg/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/"          /home/builder/pkg/PKGBUILD
+          # Also update asset name if version changed (x86_64 naming)
+          sed -i "s/\${_appname}-\${pkgver}-linux-x86_64\.AppImage/\${_appname}-\${NEW_VER}-linux-x86_64.AppImage/g" /home/builder/pkg/PKGBUILD || true
+
+      # ---------------------------------------------------------------
+      # 7. Recalculate checksums as builder (updpkgsums downloads the asset)
+      # ---------------------------------------------------------------
+      - name: Update checksums
+        if: steps.current.outputs.version != steps.upstream.outputs.version
+        run: |
+          # updpkgsums must run as non-root; builder owns the directory
+          sudo -u builder bash -c "cd /home/builder/pkg && updpkgsums"
+          # Verify checksum was updated (not SKIP)
+          if grep -q "SKIP" /home/builder/pkg/PKGBUILD; then
+            echo "ERROR: updpkgsums failed to update checksum"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 8. Regenerate .SRCINFO synchronously
+      # ---------------------------------------------------------------
+      - name: Regenerate .SRCINFO
+        if: steps.current.outputs.version != steps.upstream.outputs.version
+        run: |
+          sudo -u builder bash -c \
+            "cd /home/builder/pkg && makepkg --printsrcinfo > .SRCINFO"
+
+      # ---------------------------------------------------------------
+      # 9. Commit and push only if files actually changed
+      # ---------------------------------------------------------------
+      - name: Commit and push
+        if: steps.current.outputs.version != steps.upstream.outputs.version
+        run: |
+          NEW_VER="${{ steps.upstream.outputs.version }}"
+
+          git -C /home/builder/pkg config user.name  "AUR Update Bot"
+          git -C /home/builder/pkg config user.email "bot@users.noreply.github.com"
+
+          git -C /home/builder/pkg add PKGBUILD .SRCINFO
+
+          # Guard: only commit if there is a real diff
+          if git -C /home/builder/pkg diff --cached --quiet; then
+            echo "No effective changes after checksum update — skipping commit."
+            exit 0
+          fi
+
+          git -C /home/builder/pkg commit \
+            -m "upgpkg: openwhispr-appimage ${NEW_VER}"
+          git -C /home/builder/pkg push
+
+      # ---------------------------------------------------------------
+      # 10. Summary
+      # ---------------------------------------------------------------
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## AUR Update Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Previous version | ${{ steps.current.outputs.version }} |" \
+            >> "$GITHUB_STEP_SUMMARY"
+          echo "| Upstream version | ${{ steps.upstream.outputs.version }} |" \
+            >> "$GITHUB_STEP_SUMMARY"
