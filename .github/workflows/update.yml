@@ -97,7 +97,7 @@ jobs:
       - name: Skip if already up-to-date
         if: steps.current.outputs.version == steps.upstream.outputs.version
         run: |
-          echo "Already at ${steps.upstream.outputs.version}, nothing to do."
+          echo "Already at ${{ steps.upstream.outputs.version }}, nothing to do."
           exit 0
 
       # ---------------------------------------------------------------
